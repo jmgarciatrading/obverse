@@ -1,0 +1,836 @@
+//@version=6
+indicator("HTF Array Inversion", shorttitle = "Array Inv", overlay = true, max_labels_count = 500, max_lines_count = 100)
+
+// Bias and direction are separate. At each new HTF open, bias is how the last
+// closed HTF candle finished against the candle before it. At 10:00 that is
+// the 9:00 close read against the 8:00 candle. Direction is an MTF close
+// through the opposing candles whose highs or lows the close clears. After the
+// current HTF candle has swept the previous one, that order block flips the bias.
+// A rejection waits for its own order block. After that mark, a sweep of the
+// other side and the opposing order block flip the bias and draw the new mark.
+// A closed HTF candle that swept both sides is bullish only when it closes
+// above the previous candle, and bearish only when it closes below it. That
+// side waits for its own order block. A close that does not finish above or
+// below the previous candle leaves the bias None until the first order block
+// of either side.
+// One opposing MTF order block or fair value gap follows the direction, then an
+// LTF retest and MSS/BOS. The dashboard is the working display. BUY and SELL
+// labels mark direction and a confirmed setup. The stop line uses the Display
+// color and line type. A sell uses the latest swing high, a buy the latest
+// swing low. The line is two LTF candles long on that swing. The take-profit
+// line uses its own color and line type. A bullish signal uses the newest
+// swing high of Timeframe Target that is above the signal. A bearish signal
+// uses the newest swing low that is below it. That line is two candles of
+// the target timeframe.
+//
+// Candle counts use completed MTF candles. The inversion price is the open of
+// the candle that created the array, and later candles do not replace it.
+// Confirmed higher-timeframe values use the prior bar with lookahead_on.
+// The executable spec is tests/test_array_inversion_execution.py.
+
+// ───────────────────────────────────────────────
+// Inputs
+// ───────────────────────────────────────────────
+string GRP_TF = "Timeframes"
+string htfChoice = input.string("1H", "HTF (Directional Bias)", options = ["4H", "1H"], group = GRP_TF,
+     tooltip = "Sets the bias from the last closed candle against the candle before it. A candle that swept both sides is bullish only when it closes above that candle, and bearish only when it closes below it. A close that stays inside leaves the bias None. A new candle clears the direction and the working array.")
+string mtfChoice = input.string("5M", "MTF (Opposing Array and Inversion)", options = ["15M", "5M"], group = GRP_TF,
+     tooltip = "A close through the opposing candles it actually clears sets the direction. Candles beyond the first one it does not clear are ignored. After this HTF candle has swept the previous candle, that order block flips the bias. A rejection waits for its own order block first. After that mark, the sweep and the opposing order block flip and draw the new label. This timeframe also finds the order block or fair value gap and waits for its inversion.")
+string ltfChoice = input.string("1M", "LTF (Retest and MSS/BOS)", options = ["5M", "1M"], group = GRP_TF,
+     tooltip = "Confirms the retest and the break of structure. An LTF wick can mark the HTF sweep. An LTF close does not set or flip the bias or the direction.")
+string targetChoice = input.string("15M", "Timeframe Target", options = ["Off", "1M", "5M", "15M", "1H", "4H"], group = GRP_TF,
+     tooltip = "Suggested take profit is the newest confirmed swing on this timeframe that sits beyond the signal. A bullish signal uses the swing high above its high. A bearish signal uses the swing low below its low. Off leaves the target empty. The pivot uses LTF MSS Swing Length.")
+
+string GRP_INVERSION = "Inversion"
+int maxCandles = input.int(3, "Maximum Candles to Wait for Inversion", minval = 1, maxval = 50, group = GRP_INVERSION,
+     tooltip = "Completed MTF candles after the array is identified. The array expires when none of them closes through the original creating-candle open.")
+
+string GRP_STRUCTURE = "Structure"
+int swingLength = input.int(2, "LTF MSS Swing Length", minval = 1, maxval = 20, group = GRP_STRUCTURE,
+     tooltip = "Candles required on each side of the LTF MSS pivot. The pivot is usable only after that many later candles have closed. A sell stop is the latest swing high. A buy stop is the latest swing low.")
+
+string GRP_DISPLAY = "Display"
+bool showConfirmedMarker = input.bool(true, "Show Confirmed Setup Marker", group = GRP_DISPLAY,
+     tooltip = "Draws BUY under the MTF candle that sets a bullish direction, and SELL over the candle that sets a bearish direction. A confirmed setup also draws its own label.")
+int signalStart = input.int(0, "Signal Window Start", minval = 0, maxval = 59, group = GRP_DISPLAY,
+     tooltip = "First minute of the exchange hour that can print a BUY or SELL label. 10 includes minute 10. The dashboard still updates outside this window.")
+int signalEnd = input.int(59, "Signal Window End", minval = 0, maxval = 59, group = GRP_DISPLAY,
+     tooltip = "Last minute of the exchange hour that can print a BUY or SELL label. 50 includes minute 50. Start must be less than or equal to end.")
+color stopColor = input.color(color.red, "Stop Line Color", group = GRP_DISPLAY,
+     tooltip = "Color of the stop line. The default is red. The line is two LTF candles long on the stop swing.")
+string stopStyleChoice = input.string("Solid", "Stop Line Type", options = ["Solid", "Dashed", "Dotted"], group = GRP_DISPLAY,
+     tooltip = "Solid, dashed, or dotted. The default is solid. The line is two LTF candles long on the stop swing.")
+string stopStyle = stopStyleChoice == "Dashed" ? line.style_dashed : stopStyleChoice == "Dotted" ? line.style_dotted : line.style_solid
+color targetColor = input.color(color.green, "Take Profit Line Color", group = GRP_DISPLAY,
+     tooltip = "Color of the take-profit line. The default is green. The line is two target-timeframe candles long on that swing.")
+string targetStyleChoice = input.string("Solid", "Take Profit Line Type", options = ["Solid", "Dashed", "Dotted"], group = GRP_DISPLAY,
+     tooltip = "Solid, dashed, or dotted. The default is solid. The line is two target-timeframe candles long on that swing.")
+string targetStyle = targetStyleChoice == "Dashed" ? line.style_dashed : targetStyleChoice == "Dotted" ? line.style_dotted : line.style_solid
+
+// ───────────────────────────────────────────────
+// Timeframe map and guards
+// ───────────────────────────────────────────────
+string htfPine = htfChoice == "4H" ? "240" : "60"
+string mtfPine = mtfChoice == "15M" ? "15" : "5"
+string ltfPine = ltfChoice == "5M" ? "5" : "1"
+int ltfSec = ltfChoice == "5M" ? 300 : 60
+int mtfMs = (mtfChoice == "15M" ? 900 : 300) * 1000
+int ltfMs = ltfSec * 1000
+bool targetOn = targetChoice != "Off"
+string targetPine = targetChoice == "4H" ? "240" : targetChoice == "1H" ? "60" : targetChoice == "15M" ? "15" : targetChoice == "5M" ? "5" : "1"
+int targetMs = targetChoice == "4H" ? 14400000 : targetChoice == "1H" ? 3600000 : targetChoice == "15M" ? 900000 : targetChoice == "5M" ? 300000 : 60000
+
+bool stackOk = (htfChoice == "4H" and mtfChoice == "15M" and ltfChoice == "5M") or (htfChoice == "4H" and mtfChoice == "5M" and ltfChoice == "1M") or (htfChoice == "1H" and mtfChoice == "15M" and ltfChoice == "5M") or (htfChoice == "1H" and mtfChoice == "5M" and ltfChoice == "1M")
+bool chartIsLtf = timeframe.in_seconds() == ltfSec
+bool chartOk = timeframe.in_seconds() <= ltfSec
+
+// ───────────────────────────────────────────────
+// Confirmed feeds
+// The HTF open time does not change during the candle. Bias uses the two
+// closed HTF candles: [1] is the candle that just closed, [2] is the one
+// before it. The forming HTF high and low are not read.
+// MTF and LTF values are the prior bar.
+// ───────────────────────────────────────────────
+[htfPeriodOpen, htfClosedHigh, htfClosedLow, htfClosedClose, htfPriorHigh, htfPriorLow] = request.security(
+     syminfo.tickerid, htfPine, [time, high[1], low[1], close[1], high[2], low[2]], lookahead = barmerge.lookahead_on)
+[secMtfTime, secMtfOpen, secMtfHigh, secMtfLow, secMtfClose] = request.security(
+     syminfo.tickerid, mtfPine, [time[1], open[1], high[1], low[1], close[1]], lookahead = barmerge.lookahead_on)
+[secLtfTime, secLtfHigh, secLtfLow, secLtfClose] = request.security(
+     syminfo.tickerid, ltfPine, [time[1], high[1], low[1], close[1]], lookahead = barmerge.lookahead_on)
+[secTargetTime, secTargetHigh, secTargetLow] = request.security(
+     syminfo.tickerid, targetPine, [time[1], high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+if barstate.isfirst and not stackOk
+    runtime.error("Unsupported timeframe stack. Use 4H / 15M / 5M, 4H / 5M / 1M, 1H / 15M / 5M, or 1H / 5M / 1M.")
+if barstate.isfirst and stackOk and not chartOk
+    runtime.error("Chart timeframe must be the selected LTF or lower.")
+
+// ───────────────────────────────────────────────
+// ArrayRun state
+// ───────────────────────────────────────────────
+const int ST_WAITING = 0
+const int ST_BIAS = 1
+const int ST_ARRAY = 2
+const int ST_INVERSION = 3
+const int ST_RETEST = 4
+const int ST_MSS = 5
+const int ST_CONFIRMED = 6
+
+const int EXP_NONE = 0
+const int EXP_WAITING = 1
+const int EXP_INVERTED = 2
+const int EXP_EXPIRED = 3
+
+const int KIND_OB = 1
+const int KIND_FVG = 2
+
+// Pine cannot assign global variables from a function (CE10088). The sequence
+// lives on this object, and methods update its fields.
+// A field default must be a literal (CE10132). 0 is ST_WAITING and EXP_NONE.
+type ArrayRun
+    int stage = 0
+    int bias = 0
+    int lockedBias = 0
+    int activeHtfOpen = na
+    int arrayKind = 0
+    int arrayDir = 0
+    float arrayTop = na
+    float arrayBottom = na
+    float inversionRef = na
+    int arraySourceOpen = na
+    int arrayIdentifiedOpen = na
+    int inversionMtfOpen = na
+    int candlesElapsed = 0
+    int expirationStatus = 0
+    int retestTime = na
+    float swingHigh = na
+    float swingLow = na
+    float stopLoss = na
+    int stopTime = na
+    float takeProfit = na
+    int takeProfitTime = na
+    int lastTargetTime = na
+    int swingSerial = 0
+    array<float> swingPrices
+    array<int> swingKinds
+    array<int> swingBars
+    array<int> swingTimes
+    int lastMtfTime = na
+    int lastLtfTime = na
+    int m1t = na
+    float m1o = na
+    float m1h = na
+    float m1l = na
+    float m1c = na
+    int m2t = na
+    float m2o = na
+    float m2h = na
+    float m2l = na
+    float m2c = na
+    int m3t = na
+    float m3o = na
+    float m3h = na
+    float m3l = na
+    float m3c = na
+    array<float> ltfHighs
+    array<float> ltfLows
+    array<int> ltfTimes
+    int direction = 0
+    float sweepRefHigh = na
+    float sweepRefLow = na
+    bool sweptHigh = false
+    bool sweptLow = false
+    bool rejectionBias = false
+    bool firstObBias = false
+    array<float> mtfOpens
+    array<float> mtfHighs
+    array<float> mtfLows
+    array<float> mtfCloses
+    array<float> targetHighs
+    array<float> targetLows
+    array<int> targetTimes
+    array<float> targetSwingPrices
+    array<int> targetSwingKinds
+    array<int> targetSwingTimes
+
+var ArrayRun seq = ArrayRun.new(
+     ltfHighs = array.new<float>(),
+     ltfLows = array.new<float>(),
+     ltfTimes = array.new<int>(),
+     swingPrices = array.new<float>(),
+     swingKinds = array.new<int>(),
+     swingBars = array.new<int>(),
+     swingTimes = array.new<int>(),
+     mtfOpens = array.new<float>(),
+     mtfHighs = array.new<float>(),
+     mtfLows = array.new<float>(),
+     mtfCloses = array.new<float>(),
+     targetHighs = array.new<float>(),
+     targetLows = array.new<float>(),
+     targetTimes = array.new<int>(),
+     targetSwingPrices = array.new<float>(),
+     targetSwingKinds = array.new<int>(),
+     targetSwingTimes = array.new<int>())
+
+var table dashboard = table.new(position.top_right, 7, 13, border_width = 1,
+     frame_color = color.new(color.gray, 30), frame_width = 1)
+
+// ───────────────────────────────────────────────
+// State transitions
+// ───────────────────────────────────────────────
+method f_clearArray(ArrayRun this) =>
+    this.arrayKind := 0
+    this.arrayDir := 0
+    this.arrayTop := na
+    this.arrayBottom := na
+    this.inversionRef := na
+    this.arraySourceOpen := na
+    this.arrayIdentifiedOpen := na
+    this.inversionMtfOpen := na
+    this.candlesElapsed := 0
+    this.expirationStatus := EXP_NONE
+    this.retestTime := na
+
+f_sweptBothSides(float closedHigh, float closedLow, float priorHigh, float priorLow) =>
+    // Strict sweep of both sides. The close must finish beyond that candle to set a side.
+    bool result = false
+    if not na(closedHigh) and not na(closedLow) and not na(priorHigh) and not na(priorLow)
+        result := closedHigh > priorHigh and closedLow < priorLow
+    result
+
+f_hourlyBias(float closedHigh, float closedLow, float closedClose, float priorHigh, float priorLow) =>
+    int result = 0
+    if not na(closedHigh) and not na(closedLow) and not na(closedClose) and not na(priorHigh) and not na(priorLow)
+        bool bearishClose = closedClose < priorLow
+        bool bearishReject = closedHigh > priorHigh and closedClose >= priorLow and closedClose < priorHigh
+        bool bullishClose = closedClose > priorHigh
+        bool bullishReject = closedLow < priorLow and closedClose > priorLow and closedClose <= priorHigh
+        bool bearish = bearishClose or bearishReject
+        bool bullish = bullishClose or bullishReject
+        if bearish and not bullish
+            result := -1
+        else if bullish and not bearish
+            result := 1
+    result
+
+f_rejectionBias(float closedHigh, float closedLow, float closedClose, float priorHigh, float priorLow) =>
+    // A sweep that closed back inside. The opposing order block waits until this side has signaled.
+    bool result = false
+    if not na(closedHigh) and not na(closedLow) and not na(closedClose) and not na(priorHigh) and not na(priorLow)
+        bool bearishClose = closedClose < priorLow
+        bool bearishReject = closedHigh > priorHigh and closedClose >= priorLow and closedClose < priorHigh
+        bool bullishClose = closedClose > priorHigh
+        bool bullishReject = closedLow < priorLow and closedClose > priorLow and closedClose <= priorHigh
+        bool bearish = bearishClose or bearishReject
+        bool bullish = bullishClose or bullishReject
+        result := (bearish and not bullish and bearishReject) or (bullish and not bearish and bullishReject)
+    result
+
+method f_startPeriod(ArrayRun this, int newOpen, float closedHigh, float closedLow, float closedClose, float priorHigh, float priorLow) =>
+    if na(this.activeHtfOpen) or newOpen != this.activeHtfOpen
+        bool bothSides = f_sweptBothSides(closedHigh, closedLow, priorHigh, priorLow)
+        bool bothBullish = bothSides and not na(closedClose) and closedClose > priorHigh
+        bool bothBearish = bothSides and not na(closedClose) and closedClose < priorLow
+        int nextBias = bothBullish ? 1 : bothBearish ? -1 : bothSides ? 0 : f_hourlyBias(closedHigh, closedLow, closedClose, priorHigh, priorLow)
+        this.bias := nextBias
+        this.lockedBias := nextBias
+        this.rejectionBias := bothBullish or bothBearish ? true : bothSides ? false : f_rejectionBias(closedHigh, closedLow, closedClose, priorHigh, priorLow)
+        this.firstObBias := bothSides and not bothBullish and not bothBearish
+        this.direction := 0
+        this.sweepRefHigh := closedHigh
+        this.sweepRefLow := closedLow
+        this.sweptHigh := false
+        this.sweptLow := false
+        this.stopLoss := na
+        this.stopTime := na
+        this.takeProfit := na
+        this.takeProfitTime := na
+        this.activeHtfOpen := newOpen
+        this.f_clearArray()
+        this.stage := nextBias != 0 ? ST_BIAS : ST_WAITING
+
+method f_noteSweep(ArrayRun this, int t, float h, float l) =>
+    if not na(this.activeHtfOpen) and t >= this.activeHtfOpen
+        if not na(this.sweepRefLow) and l < this.sweepRefLow
+            this.sweptLow := true
+        if not na(this.sweepRefHigh) and h > this.sweepRefHigh
+            this.sweptHigh := true
+
+method f_storeArray(ArrayRun this, int kind, int direction, float top, float bottom, float reference, int sourceOpen, int identifiedOpen) =>
+    this.arrayKind := kind
+    this.arrayDir := direction
+    this.arrayTop := top
+    this.arrayBottom := bottom
+    this.inversionRef := reference
+    this.arraySourceOpen := sourceOpen
+    this.arrayIdentifiedOpen := identifiedOpen
+    this.inversionMtfOpen := na
+    this.candlesElapsed := 0
+    this.expirationStatus := EXP_WAITING
+    this.retestTime := na
+
+method f_expire(ArrayRun this) =>
+    int keptElapsed = this.candlesElapsed
+    this.f_clearArray()
+    this.candlesElapsed := keptElapsed
+    this.expirationStatus := EXP_EXPIRED
+    this.stage := this.direction != 0 ? ST_ARRAY : this.bias != 0 ? ST_BIAS : ST_WAITING
+
+method f_tryAdopt(ArrayRun this) =>
+    bool adopted = false
+    bool bearishOb = this.direction == 1 and not na(this.m2t) and this.m2c < this.m2o and this.m1c > this.m1o and this.m1c > this.m2h and this.m2t >= this.activeHtfOpen
+    bool bullishOb = this.direction == -1 and not na(this.m2t) and this.m2c > this.m2o and this.m1c < this.m1o and this.m1c < this.m2l and this.m2t >= this.activeHtfOpen
+    bool bearishFvg = this.direction == 1 and not na(this.m3t) and this.m3l > this.m1h and this.m1t >= this.activeHtfOpen
+    bool bullishFvg = this.direction == -1 and not na(this.m3t) and this.m3h < this.m1l and this.m1t >= this.activeHtfOpen
+    if bearishOb
+        this.f_storeArray(KIND_OB, -1, this.m2h, this.m2l, this.m2o, this.m2t, this.m1t)
+        adopted := true
+    else if bullishOb
+        this.f_storeArray(KIND_OB, 1, this.m2h, this.m2l, this.m2o, this.m2t, this.m1t)
+        adopted := true
+    else if bearishFvg
+        this.f_storeArray(KIND_FVG, -1, this.m3l, this.m1h, this.m1o, this.m1t, this.m1t)
+        adopted := true
+    else if bullishFvg
+        this.f_storeArray(KIND_FVG, 1, this.m1l, this.m3h, this.m1o, this.m1t, this.m1t)
+        adopted := true
+    adopted
+
+method f_closedThroughBearish(ArrayRun this, float closePrice) =>
+    // Candles whose high is below this close. The first candle that is not cleared stops the walk.
+    bool found = false
+    int last = array.size(this.mtfCloses) - 1
+    if last >= 0
+        for index = last to 0
+            if closePrice > array.get(this.mtfHighs, index)
+                if array.get(this.mtfCloses, index) < array.get(this.mtfOpens, index)
+                    found := true
+            else
+                break
+    found
+
+method f_closedThroughBullish(ArrayRun this, float closePrice) =>
+    // Candles whose low is above this close. The first candle that is not cleared stops the walk.
+    bool found = false
+    int last = array.size(this.mtfCloses) - 1
+    if last >= 0
+        for index = last to 0
+            if closePrice < array.get(this.mtfLows, index)
+                if array.get(this.mtfCloses, index) > array.get(this.mtfOpens, index)
+                    found := true
+            else
+                break
+    found
+
+method f_pushMtf(ArrayRun this, float o, float h, float l, float c) =>
+    array.push(this.mtfOpens, o)
+    array.push(this.mtfHighs, h)
+    array.push(this.mtfLows, l)
+    array.push(this.mtfCloses, c)
+    if array.size(this.mtfOpens) > 50
+        array.shift(this.mtfOpens)
+        array.shift(this.mtfHighs)
+        array.shift(this.mtfLows)
+        array.shift(this.mtfCloses)
+
+f_inSignalWindow(int candleTime) =>
+    int minuteOfHour = minute(candleTime, syminfo.timezone)
+    not na(minuteOfHour) and minuteOfHour >= signalStart and minuteOfHour <= signalEnd
+
+f_stopTip(float stopPrice, float targetPrice, string message) =>
+    string tip = message
+    if not na(stopPrice)
+        tip := tip + "\nSL " + str.tostring(stopPrice, format.mintick)
+    if not na(targetPrice)
+        tip := tip + "\nTP " + str.tostring(targetPrice, format.mintick)
+    tip
+
+method f_latestStopSwing(ArrayRun this) =>
+    // The signal stop is the latest swing high for a sell, or the latest swing low for a buy.
+    float result = na
+    this.stopTime := na
+    int kind = this.direction > 0 ? -1 : 1
+    int count = array.size(this.swingPrices)
+    if count > 0
+        for index = count - 1 to 0
+            if array.get(this.swingKinds, index) == kind
+                result := array.get(this.swingPrices, index)
+                this.stopTime := array.get(this.swingTimes, index)
+                break
+    result
+
+method f_stopBeforeBreak(ArrayRun this, float level) =>
+    // Used only when the signal had no swing yet. The break then takes the opposite swing before it.
+    float result = na
+    this.stopTime := na
+    int kind = this.direction > 0 ? 1 : -1
+    int opposite = kind == 1 ? -1 : 1
+    int count = array.size(this.swingPrices)
+    int match = -1
+    if not na(level) and count > 0
+        for index = count - 1 to 0
+            if array.get(this.swingKinds, index) == kind and array.get(this.swingPrices, index) == level
+                match := index
+                break
+    if match > 0
+        int brokenBar = array.get(this.swingBars, match)
+        int earlier = match - 1
+        for index = earlier to 0
+            if array.get(this.swingBars, index) < brokenBar and array.get(this.swingKinds, index) == opposite
+                result := array.get(this.swingPrices, index)
+                this.stopTime := array.get(this.swingTimes, index)
+                break
+    result
+
+method f_latestTargetSwing(ArrayRun this, float price) =>
+    // The newest swing beyond the signal. A buy needs a high above it. A sell needs a low below it.
+    float result = na
+    this.takeProfitTime := na
+    bool bullish = this.direction > 0
+    int kind = bullish ? 1 : -1
+    int count = array.size(this.targetSwingPrices)
+    if not na(price) and count > 0
+        for index = count - 1 to 0
+            float swingPrice = array.get(this.targetSwingPrices, index)
+            bool beyond = bullish ? swingPrice > price : swingPrice < price
+            if array.get(this.targetSwingKinds, index) == kind and beyond
+                result := swingPrice
+                this.takeProfitTime := array.get(this.targetSwingTimes, index)
+                break
+    result
+
+method f_drawStop(ArrayRun this, int candleTime) =>
+    if showConfirmedMarker and f_inSignalWindow(candleTime) and not na(this.stopLoss)
+        int anchor = na(this.stopTime) ? candleTime : this.stopTime
+        line.new(anchor, this.stopLoss, anchor + ltfMs * 2, this.stopLoss,
+             xloc = xloc.bar_time, color = stopColor, style = stopStyle, width = 1)
+
+method f_drawTarget(ArrayRun this, int candleTime) =>
+    if targetOn and showConfirmedMarker and f_inSignalWindow(candleTime) and not na(this.takeProfit)
+        int anchor = na(this.takeProfitTime) ? candleTime : this.takeProfitTime
+        line.new(anchor, this.takeProfit, anchor + targetMs * 2, this.takeProfit,
+             xloc = xloc.bar_time, color = targetColor, style = targetStyle, width = 1)
+
+method f_placeStop(ArrayRun this, int candleTime, float level) =>
+    this.stopLoss := this.f_stopBeforeBreak(level)
+    this.f_drawStop(candleTime)
+
+method f_placeSignalStop(ArrayRun this, int candleTime) =>
+    this.stopLoss := this.f_latestStopSwing()
+    this.f_drawStop(candleTime)
+
+method f_placeSignalTarget(ArrayRun this, int candleTime, float lowPrice, float highPrice) =>
+    if targetOn
+        float beyondPrice = this.direction > 0 ? highPrice : lowPrice
+        this.takeProfit := this.f_latestTargetSwing(beyondPrice)
+    else
+        this.takeProfit := na
+        this.takeProfitTime := na
+    this.f_drawTarget(candleTime)
+
+method f_markFlip(ArrayRun this, int candleTime, float lowPrice, float highPrice) =>
+    this.f_placeSignalStop(candleTime)
+    this.f_placeSignalTarget(candleTime, lowPrice, highPrice)
+    if showConfirmedMarker and f_inSignalWindow(candleTime)
+        bool bullish = this.direction == 1
+        label.new(candleTime, bullish ? lowPrice : highPrice, bullish ? "BUY" : "SELL",
+             xloc = xloc.bar_time,
+             yloc = yloc.price,
+             style = bullish ? label.style_label_up : label.style_label_down,
+             color = bullish ? color.green : color.red,
+             textcolor = color.white,
+             size = size.small,
+             tooltip = f_stopTip(this.stopLoss, this.takeProfit, (bullish ? "Bullish" : "Bearish") + " direction"))
+
+method f_onMtf(ArrayRun this, int t, float o, float h, float l, float c) =>
+    if na(this.lastMtfTime) or t != this.lastMtfTime
+        this.lastMtfTime := t
+        this.m3t := this.m2t
+        this.m3o := this.m2o
+        this.m3h := this.m2h
+        this.m3l := this.m2l
+        this.m3c := this.m2c
+        this.m2t := this.m1t
+        this.m2o := this.m1o
+        this.m2h := this.m1h
+        this.m2l := this.m1l
+        this.m2c := this.m1c
+        this.m1t := t
+        this.m1o := o
+        this.m1h := h
+        this.m1l := l
+        this.m1c := c
+        // The wick is recorded before the close, so this candle can sweep and close through.
+        this.f_noteSweep(t, h, l)
+        bool inPeriod = not na(this.activeHtfOpen) and t >= this.activeHtfOpen
+        bool bullishThrough = inPeriod and c > o and this.f_closedThroughBearish(c)
+        bool bearishThrough = inPeriod and c < o and this.f_closedThroughBullish(c)
+        this.f_pushMtf(o, h, l, c)
+        bool directionSet = false
+        // A both-sides candle that closed back inside leaves no bias. The first order block sets it.
+        if this.firstObBias and this.direction == 0 and bullishThrough
+            this.bias := 1
+            this.lockedBias := 1
+            this.direction := 1
+            this.firstObBias := false
+            this.rejectionBias := false
+            this.f_clearArray()
+            this.stage := ST_ARRAY
+            this.f_markFlip(t, l, h)
+            directionSet := true
+        else if this.firstObBias and this.direction == 0 and bearishThrough
+            this.bias := -1
+            this.lockedBias := -1
+            this.direction := -1
+            this.firstObBias := false
+            this.rejectionBias := false
+            this.f_clearArray()
+            this.stage := ST_ARRAY
+            this.f_markFlip(t, l, h)
+            directionSet := true
+        // The swept side needs this opposing order block. A rejection uses it only after its own mark.
+        else if this.bias < 0 and bullishThrough and this.sweptLow and (not this.rejectionBias or this.direction < 0)
+            this.bias := 1
+            this.direction := 1
+            this.rejectionBias := false
+            this.f_clearArray()
+            this.stage := ST_ARRAY
+            this.f_markFlip(t, l, h)
+            directionSet := true
+        else if this.bias > 0 and bearishThrough and this.sweptHigh and (not this.rejectionBias or this.direction > 0)
+            this.bias := -1
+            this.direction := -1
+            this.rejectionBias := false
+            this.f_clearArray()
+            this.stage := ST_ARRAY
+            this.f_markFlip(t, l, h)
+            directionSet := true
+        else if this.bias < 0 and bearishThrough and this.direction != -1
+            this.direction := -1
+            if this.stage == ST_WAITING or this.stage == ST_BIAS
+                this.stage := ST_ARRAY
+            this.f_markFlip(t, l, h)
+            directionSet := true
+        else if this.bias > 0 and bullishThrough and this.direction != 1
+            this.direction := 1
+            if this.stage == ST_WAITING or this.stage == ST_BIAS
+                this.stage := ST_ARRAY
+            this.f_markFlip(t, l, h)
+            directionSet := true
+        bool trackingInversion = this.stage == ST_INVERSION and not na(this.arrayIdentifiedOpen) and not na(this.activeHtfOpen) and
+             t > this.arrayIdentifiedOpen and t >= this.activeHtfOpen
+        if not directionSet and trackingInversion
+            this.candlesElapsed := this.candlesElapsed + 1
+            bool inverted = this.direction > 0 ? c > this.inversionRef : this.direction < 0 ? c < this.inversionRef : false
+            if inverted
+                this.expirationStatus := EXP_INVERTED
+                this.inversionMtfOpen := t
+                this.stage := ST_RETEST
+            else if this.candlesElapsed >= maxCandles
+                this.f_expire()
+        else if not directionSet and this.stage == ST_ARRAY and inPeriod
+            if this.f_tryAdopt()
+                this.stage := ST_INVERSION
+
+method f_updateSwings(ArrayRun this) =>
+    int window = swingLength * 2 + 1
+    int size = array.size(this.ltfHighs)
+    if size == window
+        float pivotHigh = array.get(this.ltfHighs, swingLength)
+        float pivotLow = array.get(this.ltfLows, swingLength)
+        bool isHigh = true
+        bool isLow = true
+        for index = 0 to size - 1
+            if index != swingLength
+                if array.get(this.ltfHighs, index) >= pivotHigh
+                    isHigh := false
+                if array.get(this.ltfLows, index) <= pivotLow
+                    isLow := false
+        int pivotTime = array.get(this.ltfTimes, swingLength)
+        if isHigh
+            this.swingHigh := pivotHigh
+            array.push(this.swingPrices, pivotHigh)
+            array.push(this.swingKinds, 1)
+            array.push(this.swingBars, this.swingSerial)
+            array.push(this.swingTimes, pivotTime)
+        if isLow
+            this.swingLow := pivotLow
+            array.push(this.swingPrices, pivotLow)
+            array.push(this.swingKinds, -1)
+            array.push(this.swingBars, this.swingSerial)
+            array.push(this.swingTimes, pivotTime)
+        if array.size(this.swingPrices) > 50
+            array.shift(this.swingPrices)
+            array.shift(this.swingKinds)
+            array.shift(this.swingBars)
+            array.shift(this.swingTimes)
+        if array.size(this.swingPrices) > 50
+            array.shift(this.swingPrices)
+            array.shift(this.swingKinds)
+            array.shift(this.swingBars)
+            array.shift(this.swingTimes)
+
+method f_confirm(ArrayRun this, int candleTime, float labelPrice) =>
+    this.stage := ST_CONFIRMED
+    if showConfirmedMarker and f_inSignalWindow(candleTime)
+        label.new(candleTime, labelPrice, this.direction == 1 ? "BUY" : "SELL",
+             xloc = xloc.bar_time,
+             yloc = yloc.price,
+             style = this.direction == 1 ? label.style_label_up : label.style_label_down,
+             color = this.direction == 1 ? color.green : color.red,
+             textcolor = color.white,
+             size = size.small,
+             tooltip = f_stopTip(this.stopLoss, this.takeProfit, (this.direction == 1 ? "Bullish" : "Bearish") + " setup confirmed"))
+
+method f_onLtf(ArrayRun this, int t, float h, float l, float c) =>
+    if na(this.lastLtfTime) or t != this.lastLtfTime
+        this.lastLtfTime := t
+        this.f_noteSweep(t, h, l)
+        float armedHigh = this.swingHigh
+        float armedLow = this.swingLow
+        this.swingSerial := this.swingSerial + 1
+        array.push(this.ltfHighs, h)
+        array.push(this.ltfLows, l)
+        array.push(this.ltfTimes, t)
+        int window = swingLength * 2 + 1
+        if array.size(this.ltfHighs) > window
+            array.shift(this.ltfHighs)
+            array.shift(this.ltfLows)
+            array.shift(this.ltfTimes)
+        this.f_updateSwings()
+        bool retested = this.stage == ST_RETEST and not na(this.inversionMtfOpen) and t >= this.inversionMtfOpen + mtfMs and
+             not na(this.arrayTop) and l <= this.arrayTop and h >= this.arrayBottom
+        if retested
+            this.retestTime := t
+            this.stage := ST_MSS
+        else if this.stage == ST_MSS and not na(this.retestTime) and t > this.retestTime
+            float level = this.direction == 1 ? armedHigh : armedLow
+            bool closedThrough = this.direction == 1 ? c > level : this.direction == -1 ? c < level : false
+            bool broke = not na(level) and closedThrough
+            if broke
+                if na(this.stopLoss)
+                    this.f_placeStop(t, level)
+                this.f_confirm(t, this.direction == 1 ? l : h)
+            this.stage
+
+method f_updateTargetSwings(ArrayRun this) =>
+    int window = swingLength * 2 + 1
+    int size = array.size(this.targetHighs)
+    if size == window
+        float pivotHigh = array.get(this.targetHighs, swingLength)
+        float pivotLow = array.get(this.targetLows, swingLength)
+        bool isHigh = true
+        bool isLow = true
+        for index = 0 to size - 1
+            if index != swingLength
+                if array.get(this.targetHighs, index) >= pivotHigh
+                    isHigh := false
+                if array.get(this.targetLows, index) <= pivotLow
+                    isLow := false
+        int pivotTime = array.get(this.targetTimes, swingLength)
+        if isHigh
+            array.push(this.targetSwingPrices, pivotHigh)
+            array.push(this.targetSwingKinds, 1)
+            array.push(this.targetSwingTimes, pivotTime)
+        if isLow
+            array.push(this.targetSwingPrices, pivotLow)
+            array.push(this.targetSwingKinds, -1)
+            array.push(this.targetSwingTimes, pivotTime)
+        if array.size(this.targetSwingPrices) > 50
+            array.shift(this.targetSwingPrices)
+            array.shift(this.targetSwingKinds)
+            array.shift(this.targetSwingTimes)
+        if array.size(this.targetSwingPrices) > 50
+            array.shift(this.targetSwingPrices)
+            array.shift(this.targetSwingKinds)
+            array.shift(this.targetSwingTimes)
+
+method f_onTarget(ArrayRun this, int t, float h, float l) =>
+    if targetOn and (na(this.lastTargetTime) or t != this.lastTargetTime)
+        this.lastTargetTime := t
+        array.push(this.targetHighs, h)
+        array.push(this.targetLows, l)
+        array.push(this.targetTimes, t)
+        int window = swingLength * 2 + 1
+        if array.size(this.targetHighs) > window
+            array.shift(this.targetHighs)
+            array.shift(this.targetLows)
+            array.shift(this.targetTimes)
+        this.f_updateTargetSwings()
+
+method f_dispatch(ArrayRun this, bool includeLtf, int ltfTime, float ltfH, float ltfL, float ltfC, bool includeMtf) =>
+    int ltfClose = includeLtf ? ltfTime + ltfMs : int(na)
+    int mtfClose = includeMtf ? secMtfTime + mtfMs : int(na)
+    bool ltfFirst = includeLtf and (not includeMtf or ltfClose <= mtfClose)
+    if ltfFirst
+        this.f_onLtf(ltfTime, ltfH, ltfL, ltfC)
+        if includeMtf
+            this.f_onMtf(secMtfTime, secMtfOpen, secMtfHigh, secMtfLow, secMtfClose)
+    else
+        if includeMtf
+            this.f_onMtf(secMtfTime, secMtfOpen, secMtfHigh, secMtfLow, secMtfClose)
+        if includeLtf
+            this.f_onLtf(ltfTime, ltfH, ltfL, ltfC)
+
+method f_process(ArrayRun this) =>
+    bool hasLtf = false
+    int ltfTime = na
+    float ltfH = na
+    float ltfL = na
+    float ltfC = na
+    if chartIsLtf
+        hasLtf := na(this.lastLtfTime) or time != this.lastLtfTime
+        ltfTime := time
+        ltfH := high
+        ltfL := low
+        ltfC := close
+    else if not na(secLtfTime) and (na(this.lastLtfTime) or secLtfTime != this.lastLtfTime)
+        hasLtf := true
+        ltfTime := secLtfTime
+        ltfH := secLtfHigh
+        ltfL := secLtfLow
+        ltfC := secLtfClose
+
+    bool hasMtf = not na(secMtfTime) and (na(this.lastMtfTime) or secMtfTime != this.lastMtfTime)
+    bool hasTarget = targetOn and not na(secTargetTime) and (na(this.lastTargetTime) or secTargetTime != this.lastTargetTime)
+    bool htfReady = not na(htfPeriodOpen)
+    bool htfRoll = htfReady and (na(this.activeHtfOpen) or htfPeriodOpen != this.activeHtfOpen)
+    bool starting = na(this.activeHtfOpen)
+
+    if htfRoll and starting
+        this.f_startPeriod(htfPeriodOpen, htfClosedHigh, htfClosedLow, htfClosedClose, htfPriorHigh, htfPriorLow)
+        if hasTarget
+            this.f_onTarget(secTargetTime, secTargetHigh, secTargetLow)
+        this.f_dispatch(hasLtf, ltfTime, ltfH, ltfL, ltfC, hasMtf)
+    else if htfRoll
+        bool ltfBefore = hasLtf and ltfTime < htfPeriodOpen
+        bool mtfBefore = hasMtf and secMtfTime < htfPeriodOpen
+        bool targetBefore = hasTarget and secTargetTime < htfPeriodOpen
+        if targetBefore
+            this.f_onTarget(secTargetTime, secTargetHigh, secTargetLow)
+        this.f_dispatch(ltfBefore, ltfTime, ltfH, ltfL, ltfC, mtfBefore)
+        this.f_startPeriod(htfPeriodOpen, htfClosedHigh, htfClosedLow, htfClosedClose, htfPriorHigh, htfPriorLow)
+        if hasTarget and not targetBefore
+            this.f_onTarget(secTargetTime, secTargetHigh, secTargetLow)
+        this.f_dispatch(hasLtf and not ltfBefore, ltfTime, ltfH, ltfL, ltfC, hasMtf and not mtfBefore)
+    else
+        if hasTarget
+            this.f_onTarget(secTargetTime, secTargetHigh, secTargetLow)
+        this.f_dispatch(hasLtf, ltfTime, ltfH, ltfL, ltfC, hasMtf)
+
+// ───────────────────────────────────────────────
+// Dashboard
+// ───────────────────────────────────────────────
+f_stageName(int index) =>
+    switch index
+        0 => "WAITING"
+        1 => "BIAS"
+        2 => "ARRAY"
+        3 => "INVERSION"
+        4 => "RETEST"
+        5 => "MSS/BOS"
+        6 => "CONFIRMED"
+        => "WAITING"
+
+f_arrayText() =>
+    seq.arrayKind == KIND_OB and seq.arrayDir < 0 ? "Bearish OB" :
+         seq.arrayKind == KIND_OB and seq.arrayDir > 0 ? "Bullish OB" :
+         seq.arrayKind == KIND_FVG and seq.arrayDir < 0 ? "Bearish FVG" :
+         seq.arrayKind == KIND_FVG and seq.arrayDir > 0 ? "Bullish FVG" : "None"
+
+f_expirationText() =>
+    switch seq.expirationStatus
+        1 => "Waiting"
+        2 => "Inverted"
+        3 => "Expired"
+        => "None"
+
+f_row(int row, string rowName, string value, color valueColor, color labelBg, color valueBg) =>
+    table.cell(dashboard, 0, row, rowName, bgcolor = labelBg, text_color = color.white,
+         text_size = size.small, text_halign = text.align_left)
+    table.cell(dashboard, 1, row, value, bgcolor = valueBg, text_color = valueColor,
+         text_size = size.small, text_halign = text.align_left)
+    for column = 2 to 6
+        table.cell(dashboard, column, row, "", bgcolor = valueBg)
+
+f_render() =>
+    color doneColor = color.rgb(46, 125, 50)
+    color currentColor = color.rgb(255, 213, 79)
+    color futureColor = color.rgb(97, 97, 97)
+    color rowLabel = color.rgb(13, 37, 84)
+    color rowValue = color.rgb(28, 28, 28)
+    for column = 0 to 6
+        color cellColor = column < seq.stage ? doneColor : column == seq.stage ? currentColor : futureColor
+        table.cell(dashboard, column, 0, f_stageName(column), bgcolor = cellColor,
+             text_color = column == seq.stage ? color.black : color.white, text_size = size.small,
+             text_halign = text.align_center)
+    f_row(1, "HTF / MTF / LTF", htfChoice + " / " + mtfChoice + " / " + ltfChoice, color.white, rowLabel, rowValue)
+    string biasText = seq.bias > 0 ? "Bullish" : seq.bias < 0 ? "Bearish" : "None"
+    if seq.bias != 0 and seq.bias != seq.lockedBias
+        biasText := biasText + " flip"
+    f_row(2, "Directional bias", biasText, seq.bias > 0 ? color.lime : seq.bias < 0 ? color.red : color.silver, rowLabel, rowValue)
+    string directionText = seq.direction > 0 ? "Bullish" : seq.direction < 0 ? "Bearish" : "None"
+    f_row(3, "Direction", directionText, seq.direction > 0 ? color.lime : seq.direction < 0 ? color.red : color.silver, rowLabel, rowValue)
+    f_row(4, "Execution stage", f_stageName(seq.stage), currentColor, rowLabel, rowValue)
+    f_row(5, "Array type", f_arrayText(), color.white, rowLabel, rowValue)
+    f_row(6, "Inversion reference", na(seq.inversionRef) ? "—" : str.tostring(seq.inversionRef, format.mintick),
+         color.white, rowLabel, rowValue)
+    f_row(7, "Inversion countdown", seq.expirationStatus == EXP_NONE ? "—" : str.tostring(seq.candlesElapsed) + "/" +
+         str.tostring(maxCandles) + " elapsed", color.white, rowLabel, rowValue)
+    color expirationColor = seq.expirationStatus == EXP_EXPIRED ? color.orange :
+         seq.expirationStatus == EXP_INVERTED ? color.lime : seq.expirationStatus == EXP_WAITING ? color.yellow : color.silver
+    f_row(8, "Expiration status", f_expirationText(), expirationColor, rowLabel, rowValue)
+    f_row(9, "Retest status", seq.stage >= ST_MSS ? "Confirmed" : seq.stage == ST_RETEST ? "Waiting" : "—",
+         seq.stage >= ST_MSS ? color.lime : color.white, rowLabel, rowValue)
+    f_row(10, "MSS/BOS status", seq.stage == ST_CONFIRMED ? "Confirmed" : seq.stage == ST_MSS ? "Waiting" : "—",
+         seq.stage == ST_CONFIRMED ? color.lime : color.white, rowLabel, rowValue)
+    f_row(11, "Stop loss", na(seq.stopLoss) ? "—" : str.tostring(seq.stopLoss, format.mintick),
+         color.white, rowLabel, rowValue)
+    f_row(12, "Take profit", na(seq.takeProfit) ? "—" : str.tostring(seq.takeProfit, format.mintick),
+         color.white, rowLabel, rowValue)
+
+if barstate.isconfirmed and stackOk and chartOk
+    seq.f_process()
+
+if barstate.islast and stackOk and chartOk
+    f_render()
