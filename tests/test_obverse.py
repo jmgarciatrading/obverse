@@ -1,4 +1,4 @@
-"""Executable spec for Array_Inversion_Execution.pine.
+"""Executable spec for Obverse.pine.
 
 The engine below is the trading model. The Pine script is a port of it.
 Tests lock timeframe stacks, immutable inversion references, MTF candle
@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-PINE = ROOT / "Array_Inversion_Execution.pine"
+PINE = ROOT / "Obverse.pine"
 
 ST_WAITING = 0
 ST_BIAS = 1
@@ -732,7 +732,7 @@ def arm_bullish_swing(model: Model) -> None:
     model.on_ltf(Candle(70, 100, 90, 89, 90))
 
 
-class SequenceTests(unittest.TestCase):
+class ObverseTests(unittest.TestCase):
     def test_hourly_bias_matrix(self):
         prior = Candle(-60, 100, 100, 80, 90)
         self.assertEqual(htf_bias(Candle(0, 90, 95, 70, 75), prior), -1)
@@ -1782,7 +1782,7 @@ class SourceContractTests(unittest.TestCase):
     def test_pine_indicator_matches_the_execution_contract(self):
         source = PINE.read_text(encoding="utf-8")
         self.assertIn("//@version=6", source)
-        self.assertIn('indicator("HTF Array Inversion"', source)
+        self.assertIn('indicator("Obverse", shorttitle = "Obverse"', source)
         self.assertNotIn("strategy(", source)
         self.assertNotIn("box.new", source)
         self.assertEqual(source.count("line.new"), 2)

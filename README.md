@@ -1,8 +1,6 @@
 # Obverse
 
-HTF Array Inversion.
-
-`Array_Inversion_Execution.pine` is a TradingView Pine v6 overlay. It walks one execution sequence and reports that sequence on the dashboard.
+`Obverse.pine` is a TradingView Pine v6 overlay. It walks one execution sequence and reports that sequence on the dashboard.
 
 The chart stays clear. Intermediate order blocks, gaps, and swing levels are not drawn. The MTF candle that sets the direction draws BUY under its low, or SELL over its high. The full sequence can also draw its own BUY or SELL label when it confirms.
 
@@ -98,7 +96,7 @@ Closed MTF candles are read with `time[1]`, `open[1]`, `high[1]`, `low[1]`, and 
 ## Tests
 
 ```bash
-python3 -m unittest tests.test_array_inversion_execution -q
+python3 -m unittest tests.test_obverse -q
 ```
 
 This workspace has no Pine compiler. Paste the script into TradingView once, with the cursor in column 1, and confirm it compiles on a 1-minute chart before relying on the dashboard. If line 2 or the first input is indented, select all and press Shift+Tab once. TradingView keeps the timeframe choices already saved on the chart.

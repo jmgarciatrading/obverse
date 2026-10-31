@@ -1,5 +1,5 @@
 //@version=6
-indicator("HTF Array Inversion", shorttitle = "Array Inv", overlay = true, max_labels_count = 500, max_lines_count = 100)
+indicator("Obverse", shorttitle = "Obverse", overlay = true, max_labels_count = 500, max_lines_count = 100)
 
 // Bias and direction are separate. At each new HTF open, bias is how the last
 // closed HTF candle finished against the candle before it. At 10:00 that is
@@ -26,7 +26,7 @@ indicator("HTF Array Inversion", shorttitle = "Array Inv", overlay = true, max_l
 // Candle counts use completed MTF candles. The inversion price is the open of
 // the candle that created the array, and later candles do not replace it.
 // Confirmed higher-timeframe values use the prior bar with lookahead_on.
-// The executable spec is tests/test_array_inversion_execution.py.
+// The executable spec is tests/test_obverse.py.
 
 // ───────────────────────────────────────────────
 // Inputs
